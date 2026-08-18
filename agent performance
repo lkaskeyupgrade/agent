@@ -1,0 +1,116 @@
+with application_agent as (
+    select 
+        ad.application_id
+        ,max(ord.agent_details_id) as agent_details_id
+        ,min(s.create_date) as agent_create_date
+        ,collect_set(s.type) as type
+        ,collect_set(s.external_roles) as external_roles
+    from commercial_analytics.public.bi_application_detailed ad
+        left join commercial_analytics.public.bi_application a  
+            on ad.application_id = a.application_id
+        
+        left join databrickstors_canalytics_catalog.bnplapplication.order_request ord
+            on al.order_details_id = ord.order_details_id
+        
+        left join commercial_analytics.public.agent_email_dsr3482 s
+            on ord.agent_details_id = s.id
+    group by a.application_id
+)
+
+
+,apps as (
+    select 
+        coalesce(m.canonical_name, coalesce(a.partner_grouping_redshift, a.partner_grouping_legacy)) as partner_group
+        ,regexp_replace(a.agent_email, '^UP-[^_]+_', '') as cleaned_email
+        ,a.date_etz as app_date
+        ,count(*) as total_applications
+        ,max(aa.agent_details_id) as agent_details_id
+        ,min(aa.agent_create_date) as agent_create_date
+        ,array_distinct(flatten(collect_list(aa.type))) as type
+        ,array_distinct(flatten(collect_list(aa.external_roles))) as external_roles
+    from commercial_analytics.public.bi_application_detailed a
+        left join commercial_analytics.public.partner_name_mapping m
+            on upper(trim(coalesce(a.partner_grouping_redshift, a.partner_grouping_legacy))) = upper(trim(m.raw_name))
+        left join application_agent aa
+             on a.application_id = aa.application_id
+    
+        inner join commercial_analytics.public.partner_classification_aggregate p 
+            on upper(a.partner_short)  = upper(p.partner_short)
+        where 1=1
+        and agent_email is not null
+        and a.date_etz >= '2026-01-01'
+        and upper(p.channel) = 'AGENT' 
+        group by all
+)
+,loans as (
+    select 
+        coalesce(m.canonical_name, coalesce(l.partner_grouping_redshift, l.partner_grouping_legacy)) as partner_group
+        ,regexp_replace(l.agent_email, '^UP-[^_]+_', '') as cleaned_email
+        ,l.date_etz as loan_date
+        ,count(*) as total_loans
+        ,sum(l.gmv_usd) as gmv
+        ,sum(case when l.partner_confirmation is null or trim(l.partner_confirmation) = '' then 0 else size(split(l.partner_confirmation, ',')) end) as cabins_booked
+        ,max(aa.agent_details_id) as agent_details_id
+        ,min(aa.agent_create_date) as agent_create_date
+        ,array_distinct(flatten(collect_list(aa.type))) as type
+        ,array_distinct(flatten(collect_list(aa.external_roles))) as external_roles
+    from commercial_analytics.public.bi_loan_detailed l
+        left join commercial_analytics.public.bi_application_detailed la
+            on l.loan_id = la.application_id
+        left join commercial_analytics.public.partner_name_mapping m
+            on upper(trim(coalesce(l.partner_grouping_redshift, l.partner_grouping_legacy))) = upper(trim(m.raw_name))
+        left join application_agent aa
+            on l.loan_id = aa.application_id
+    where l.date_etz >= '2026-01-01'
+        and l.loan_count = 1
+        and (la.date_etz is null or l.date_etz >= la.date_etz)
+        and lower(l.channel) = 'agent'
+        and l.agent_email is not null
+    group by all
+)
+,combined as (
+    select 
+        coalesce(a.cleaned_email, l.cleaned_email) as cleaned_email
+        ,coalesce(a.partner_group, l.partner_group) as partner_group
+        ,coalesce(a.app_date, l.loan_date) as activity_date
+        ,a.total_applications
+        ,l.total_loans
+        ,l.gmv
+        ,l.cabins_booked
+        ,coalesce(a.agent_details_id, l.agent_details_id) as agent_details_id
+        ,least(a.agent_create_date, l.agent_create_date) as agent_create_date
+        ,array_union(coalesce(a.type, array()), coalesce(l.type, array())) as type
+        ,array_union(coalesce(a.external_roles, array()), coalesce(l.external_roles, array())) as external_roles
+    from apps a
+        full outer join loans l
+            on trim(lower(a.cleaned_email)) = trim(lower(l.cleaned_email))
+            and trim(lower(a.partner_group)) = trim(lower(l.partner_group))
+            and a.app_date = l.loan_date
+)
+
+select distinct
+    c.cleaned_email
+    ,c.partner_group
+    ,c.activity_date
+    ,c.total_applications
+    ,c.total_loans
+    ,c.gmv
+    ,c.cabins_booked
+    ,c.agent_details_id
+    ,c.agent_create_date
+    ,c.type
+    ,c.external_roles
+    ,g.partner as gums_partner
+    ,g.id
+    ,g.name
+    ,g.family_name
+    ,g.email as gums_email
+    ,g.enabled as gums_enabled
+    ,g.status as gums_email_status
+    ,g.certified
+from combined c
+    left join hive_metastore.bi_layer.bi_gums_agent g
+        on trim(lower(c.cleaned_email)) = trim(lower(g.email))
+        and (contains(lower(c.partner_group), lower(g.partner)) or contains(lower(g.partner), lower(c.partner_group)))
+where g.up_code is null or right(g.up_code, 2) <> '99'
+order by 1, 2, 3
