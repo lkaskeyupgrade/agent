@@ -1,17 +1,26 @@
 %sql
 
--- ==========================================================
+-- ====================================================================
 -- PREREQUISITES (run once, or whenever source data/crosswalk changes)
--- ==========================================================
+-- ====================================================================
 
-
-create or replace table commercial_analytics.public.agent_email_eng as
+create or replace table commercial_analytics.dev.agent_email_eng as
 select * 
 from read_files(
     '/Volumes/commercial_analytics/commercial_analytics/agent_email/dsr-3550_dec.csv',
     format => 'csv',
     header => true
 );
+
+-- ==========================================================
+-- MAIN QUERY (daily grain) could combine application agent with the join 
+--to applications but kept --seperate for readability
+--Groups by application_id and uses max/min/collect_set to collapse potential fan-out (multiple action_log/order_request matches) into exactly one row per application
+-- ==========================================================
+
+
+--strange partner names corrected here
+create or replace table commercial_analytics.dev.agent_email_performance as
 
 with partner_name_mapping (raw_name, canonical_name) as (
     values
@@ -30,16 +39,8 @@ with partner_name_mapping (raw_name, canonical_name) as (
         ('JetBlue', 'JetBlue Vacations')
 )
 
-%sql
--- ==========================================================
--- MAIN QUERY (daily grain) could combine application agent with the join 
---to applications but kept --seperate for readability
---Groups by application_id and uses max/min/collect_set to collapse potential fan-out (multiple action_log/order_request matches) into exactly one row per application
--- ==========================================================
-
-create or replace table commercial_analytics.public.agent_email_performance as
-
-with application_agent as (
+--connect order_details_id as a bridge between the agent file eng gave us and bi_application_detailed
+,application_agent as (
     select 
         a.application_id
         ,max(ord.agent_details_id) as agent_details_id
@@ -47,18 +48,26 @@ with application_agent as (
         ,collect_set(s.type) as type
         ,collect_set(s.external_roles) as external_roles
     from commercial_analytics.public.bi_application_detailed a
-        left join databrickstors_canalytics_catalog.bnplapplication.action_log al
+        left join (select distinct application_id, order_details_id from databrickstors_canalytics_catalog.bnplapplication.action_log 
+        where 1=1
+        and create_date >= '2026-01-01'
+        and application_id is not null
+                ) al
             on a.application_id = al.application_id
         left join databrickstors_canalytics_catalog.bnplapplication.order_request ord
             on al.order_details_id = ord.order_details_id
-        left join commercial_analytics.public.agent_email_dsr3482 s
+        left join commercial_analytics.dev.agent_email_eng s
             on ord.agent_details_id = s.id
+        where a.date_etz >= '2026-01-01'
     group by a.application_id
 )
+
+
 ,apps as (
     select 
         a.application_id
         ,coalesce(m.canonical_name, coalesce(a.partner_grouping_redshift, a.partner_grouping_legacy)) as partner_group
+        ,a.partner_short
         ,regexp_replace(a.agent_email, '^UP-[^_]+_', '') as cleaned_email
         ,a.date_etz as app_date
         ,aa.agent_details_id
@@ -66,17 +75,20 @@ with application_agent as (
         ,aa.type
         ,aa.external_roles
     from commercial_analytics.public.bi_application_detailed a
-        left join commercial_analytics.public.partner_name_mapping m
+        left join partner_name_mapping m
             on upper(trim(coalesce(a.partner_grouping_redshift, a.partner_grouping_legacy))) = upper(trim(m.raw_name))
         left join application_agent aa
             on a.application_id = aa.application_id
-    where a.agent_email is not null
+    where 1=1
+    and a.agent_email is not null
       and a.date_etz >= '2026-01-01'
+    --  and lower(a.channel) = 'agent'
 )
 ,loans as (
     select 
         l.loan_id
         ,coalesce(m.canonical_name, coalesce(l.partner_grouping_redshift, l.partner_grouping_legacy)) as partner_group
+        ,l.partner_short
         ,regexp_replace(l.agent_email, '^UP-[^_]+_', '') as cleaned_email
         ,l.date_etz as loan_date
         ,l.gmv_usd as gmv
@@ -88,7 +100,7 @@ with application_agent as (
     from commercial_analytics.public.bi_loan_detailed l
         left join commercial_analytics.public.bi_application_detailed la
             on l.loan_id = la.application_id
-        left join commercial_analytics.public.partner_name_mapping m
+        left join partner_name_mapping m
             on upper(trim(coalesce(l.partner_grouping_redshift, l.partner_grouping_legacy))) = upper(trim(m.raw_name))
         left join application_agent aa
             on l.loan_id = aa.application_id
@@ -103,6 +115,7 @@ with application_agent as (
         coalesce(a.application_id, l.loan_id) as application_id
         ,coalesce(a.cleaned_email, l.cleaned_email) as cleaned_email
         ,coalesce(a.partner_group, l.partner_group) as partner_group
+        ,coalesce(a.partner_short, l.partner_short) as partner_short
         ,coalesce(a.app_date, l.loan_date) as activity_date
         ,case when a.application_id is not null then 1 else 0 end as total_applications
         ,case when l.loan_id is not null then 1 else 0 end as total_loans
@@ -120,6 +133,7 @@ select distinct
     c.application_id
     ,c.cleaned_email
     ,c.partner_group
+    ,c.partner_short
     ,c.activity_date
     ,c.total_applications
     ,c.total_loans
@@ -129,7 +143,7 @@ select distinct
     ,c.agent_create_date
     ,c.type
     ,c.external_roles
-    ,g.partner as gums_partner
+   -- ,g.partner as gums_partner
     ,g.id
     ,g.name
     ,g.family_name
