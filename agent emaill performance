@@ -1,25 +1,22 @@
-%sql
-
 -- ====================================================================
--- PREREQUISITES (run once, or whenever source data/crosswalk changes)
+-- PREREQUISITE (run once, or whenever the source CSV changes)
 -- ====================================================================
 
 create or replace table commercial_analytics.dev.agent_email_eng as
-select * 
+select *
 from read_files(
     '/Volumes/commercial_analytics/commercial_analytics/agent_email/dsr-3550_dec.csv',
     format => 'csv',
     header => true
 );
 
--- ==========================================================
--- MAIN QUERY (daily grain) could combine application agent with the join 
---to applications but kept --seperate for readability
---Groups by application_id and uses max/min/collect_set to collapse potential fan-out (multiple action_log/order_request matches) into exactly one row per application
--- ==========================================================
 
+-- ====================================================================
+-- MAIN QUERY
+-- Part 1: every 2026 application/loan, enriched with GUMS (test agents removed)
+-- Part 2: active GUMS agents with NO 2026 activity (no_2026_activity = 1)
+-- ====================================================================
 
---strange partner names corrected here
 create or replace table commercial_analytics.dev.agent_email_performance as
 
 with partner_name_mapping (raw_name, canonical_name) as (
@@ -39,34 +36,59 @@ with partner_name_mapping (raw_name, canonical_name) as (
         ('JetBlue', 'JetBlue Vacations')
 )
 
---connect order_details_id as a bridge between the agent file eng gave us and bi_application_detailed
-,application_agent as (
-    select 
-        a.application_id
-        ,max(ord.agent_details_id) as agent_details_id
-        ,min(s.create_date) as agent_create_date
-        ,collect_set(s.type) as type
-        ,collect_set(s.external_roles) as external_roles
-    from commercial_analytics.public.bi_application_detailed a
-        left join (select distinct application_id, order_details_id from databrickstors_canalytics_catalog.bnplapplication.action_log 
-        where 1=1
-        and create_date >= '2026-01-01'
-        and application_id is not null
-                ) al
-            on a.application_id = al.application_id
-        left join databrickstors_canalytics_catalog.bnplapplication.order_request ord
-            on al.order_details_id = ord.order_details_id
-        left join commercial_analytics.dev.agent_email_eng s
-            on ord.agent_details_id = s.id
-        where a.date_etz >= '2026-01-01'
-    group by a.application_id
+-- test agents = emails whose GUMS records are ALL up_code -99
+-- (agents with both a -51 and a -99 record are real and are kept)
+,test_agents as (
+    select trim(lower(regexp_replace(email, '^UP-[^_]+_', ''))) as email
+    from hive_metastore.bi_layer.bi_gums_agent
+    group by trim(lower(regexp_replace(email, '^UP-[^_]+_', '')))
+    having min(case when right(trim(up_code), 2) = '99' then 1 else 0 end) = 1
 )
 
+-- real GUMS records only (the -99 records are ignored)
+-- email_key = email with the 'UP-xxxx_' prefix removed, same as the activity side
+,gums as (
+    select *
+        ,trim(lower(regexp_replace(email, '^UP-[^_]+_', ''))) as email_key
+    from hive_metastore.bi_layer.bi_gums_agent
+    where up_code is null or right(trim(up_code), 2) <> '99'
+)
+
+-- one row per application; the agent with the highest agent_details_id wins
+,application_agent as (
+    select application_id, agent_details_id, agent_create_date, type, external_roles
+    from (
+        select
+            a.application_id
+            ,ord.agent_details_id
+            ,s.create_date as agent_create_date
+            ,s.type
+            ,s.external_roles
+            ,row_number() over (
+                partition by a.application_id
+                order by ord.agent_details_id desc nulls last
+            ) as rn
+        from commercial_analytics.public.bi_application_detailed a
+            left join (
+                select distinct application_id, order_details_id
+                from databrickstors_canalytics_catalog.bnplapplication.action_log
+                where create_date >= '2026-01-01'
+                  and application_id is not null
+            ) al
+                on a.application_id = al.application_id
+            left join databrickstors_canalytics_catalog.bnplapplication.order_request ord
+                on al.order_details_id = ord.order_details_id
+            left join commercial_analytics.dev.agent_email_eng s
+                on ord.agent_details_id = s.id
+        where a.date_etz >= '2026-01-01'
+    )
+    where rn = 1
+)
 
 ,apps as (
-    select 
+    select
         a.application_id
-        ,coalesce(m.canonical_name, coalesce(a.partner_grouping_redshift, a.partner_grouping_legacy)) as partner_group
+        ,coalesce(m.canonical_name, a.partner_grouping_redshift, a.partner_grouping_legacy) as partner_group
         ,a.partner_short
         ,regexp_replace(a.agent_email, '^UP-[^_]+_', '') as cleaned_email
         ,a.date_etz as app_date
@@ -79,20 +101,27 @@ with partner_name_mapping (raw_name, canonical_name) as (
             on upper(trim(coalesce(a.partner_grouping_redshift, a.partner_grouping_legacy))) = upper(trim(m.raw_name))
         left join application_agent aa
             on a.application_id = aa.application_id
-    where 1=1
-    and a.agent_email is not null
+    where a.agent_email is not null
       and a.date_etz >= '2026-01-01'
-    --  and lower(a.channel) = 'agent'
+      -- and lower(a.channel) = 'agent'
+      and not exists (
+            select 1 from test_agents t
+            where t.email = trim(lower(regexp_replace(a.agent_email, '^UP-[^_]+_', '')))
+      )
 )
+
 ,loans as (
-    select 
+    select
         l.loan_id
-        ,coalesce(m.canonical_name, coalesce(l.partner_grouping_redshift, l.partner_grouping_legacy)) as partner_group
+        ,coalesce(m.canonical_name, l.partner_grouping_redshift, l.partner_grouping_legacy) as partner_group
         ,l.partner_short
         ,regexp_replace(l.agent_email, '^UP-[^_]+_', '') as cleaned_email
         ,l.date_etz as loan_date
         ,l.gmv_usd as gmv
-        ,case when l.partner_confirmation is null or trim(l.partner_confirmation) = '' then 0 else size(split(l.partner_confirmation, ',')) end as cabins_booked
+        ,case when l.partner_confirmation is null or trim(l.partner_confirmation) = ''
+              then 0
+              else size(split(l.partner_confirmation, ','))
+         end as cabins_booked
         ,aa.agent_details_id
         ,aa.agent_create_date
         ,aa.type
@@ -105,13 +134,18 @@ with partner_name_mapping (raw_name, canonical_name) as (
         left join application_agent aa
             on l.loan_id = aa.application_id
     where l.date_etz >= '2026-01-01'
-        and l.loan_count = 1
-        and (la.date_etz is null or l.date_etz >= la.date_etz)
-        and lower(l.channel) = 'agent'
-        and l.agent_email is not null
+      and l.loan_count = 1
+      and (la.date_etz is null or l.date_etz >= la.date_etz)
+      and lower(l.channel) = 'agent'
+      and l.agent_email is not null
+      and not exists (
+            select 1 from test_agents t
+            where t.email = trim(lower(regexp_replace(l.agent_email, '^UP-[^_]+_', '')))
+      )
 )
+
 ,combined as (
-    select 
+    select
         coalesce(a.application_id, l.loan_id) as application_id
         ,coalesce(a.cleaned_email, l.cleaned_email) as cleaned_email
         ,coalesce(a.partner_group, l.partner_group) as partner_group
@@ -122,37 +156,128 @@ with partner_name_mapping (raw_name, canonical_name) as (
         ,l.gmv
         ,l.cabins_booked
         ,coalesce(a.agent_details_id, l.agent_details_id) as agent_details_id
-        ,least(a.agent_create_date, l.agent_create_date) as agent_create_date
-        ,array_join(array_distinct(coalesce(a.type, array()) || coalesce(l.type, array())), ', ') as type
-        ,array_join(array_distinct(coalesce(a.external_roles, array()) || coalesce(l.external_roles, array())), ', ') as external_roles
+        ,coalesce(a.agent_create_date, l.agent_create_date) as agent_create_date
+        ,coalesce(a.type, l.type) as type
+        ,coalesce(a.external_roles, l.external_roles) as external_roles
     from apps a
         full outer join loans l
             on a.application_id = l.loan_id
 )
-select distinct
-    c.application_id
-    ,c.cleaned_email
-    ,c.partner_group
-    ,c.partner_short
-    ,c.activity_date
-    ,c.total_applications
-    ,c.total_loans
-    ,c.gmv
-    ,c.cabins_booked
-    ,c.agent_details_id
-    ,c.agent_create_date
-    ,c.type
-    ,c.external_roles
-   -- ,g.partner as gums_partner
-    ,g.id
-    ,g.name
-    ,g.family_name
-    ,g.email as gums_email
-    ,g.enabled as gums_enabled
-    ,g.status as gums_email_status
-    ,g.certified
-from combined c
-    left join hive_metastore.bi_layer.bi_gums_agent g
-        on trim(lower(c.cleaned_email)) = trim(lower(g.email))
-        and (contains(lower(c.partner_group), lower(g.partner)) or contains(lower(g.partner), lower(c.partner_group)))
-where g.up_code is null or right(g.up_code, 2) <> '99'
+
+,gums_matched as (
+    select
+        c.*
+        ,g.id
+        ,g.name
+        ,g.family_name
+        ,g.email    as gums_email
+        ,g.enabled  as gums_enabled
+        ,g.status   as gums_email_status
+        ,g.certified
+        ,g.partner  as gums_partner
+        ,case
+            when g.id is null then null
+            when g.partner is not null and trim(g.partner) <> ''
+                 and (contains(lower(c.partner_group), lower(g.partner))
+                      or contains(lower(g.partner), lower(c.partner_group))) then 1
+            else 0
+         end as partner_match
+        ,row_number() over (
+            partition by c.application_id
+            order by
+                case
+                    when g.id is null then 2
+                    when g.partner is not null and trim(g.partner) <> ''
+                         and (contains(lower(c.partner_group), lower(g.partner))
+                              or contains(lower(g.partner), lower(c.partner_group))) then 0
+                    else 1
+                end,
+                g.enabled desc nulls last,
+                g.id
+        ) as rn
+    from combined c
+        left join gums g
+            on trim(lower(c.cleaned_email)) = g.email_key
+)
+
+-- PART 1 + PART 2 combined into one CTE so we can add the "days since last application" fields
+,final_rows as (
+
+    -- PART 1: all 2026 activity
+    select
+        application_id, cleaned_email, partner_group, partner_short, activity_date
+        ,total_applications, total_loans, gmv, cabins_booked
+        ,agent_details_id, agent_create_date, type, external_roles
+        ,id, name, family_name, gums_email, gums_enabled, gums_email_status, certified
+        ,gums_partner, partner_match
+        ,0 as no_2026_activity
+    from gums_matched
+    where rn = 1
+
+    union all
+
+    -- PART 2: active GUMS agents with no 2026 activity at all
+    select
+        null                       as application_id
+        ,g.email_key               as cleaned_email
+        ,g.partner                 as partner_group
+        ,null                      as partner_short
+        ,null                      as activity_date
+        ,0                         as total_applications
+        ,0                         as total_loans
+        ,null                      as gmv
+        ,null                      as cabins_booked
+        ,null                      as agent_details_id
+        ,null                      as agent_create_date
+        ,null                      as type
+        ,null                      as external_roles
+        ,g.id
+        ,g.name
+        ,g.family_name
+        ,g.email                   as gums_email
+        ,g.enabled                 as gums_enabled
+        ,g.status                  as gums_email_status
+        ,g.certified
+        ,g.partner                 as gums_partner
+        ,null                      as partner_match
+        ,1                         as no_2026_activity
+    from gums g
+    where g.enabled = 1
+      and g.status = 'CONFIRMED'
+      and not exists (
+            select 1 from combined c
+            where trim(lower(c.cleaned_email)) = g.email_key
+      )
+)
+
+-- most recent application per agent (applications only, not loan-only rows)
+,agent_last_application as (
+    select
+        trim(lower(cleaned_email)) as email
+        ,max(case when total_applications = 1 then cast(activity_date as date) end) as last_application_date
+        ,sum(total_loans) as loans_2026
+    from final_rows
+    group by trim(lower(cleaned_email))
+)
+
+select
+    f.*
+    ,l.last_application_date
+    ,datediff(
+        cast(from_utc_timestamp(current_timestamp(), 'America/New_York') as date),
+        l.last_application_date
+     ) as days_since_last_application          -- NULL when the agent has no application
+    ,case
+        when l.last_application_date is not null then 'Has 2026 application'
+        when l.loans_2026 > 0                    then 'No 2026 application (loans only)'
+        else                                          'No 2026 activity'
+     end as application_signal
+    ,case
+        when f.no_2026_activity = 1 then 'GUMS only (no 2026 activity)'
+        when f.id is null           then 'Activity only (email not in GUMS)'
+        when f.partner_match = 0    then 'Activity + GUMS (partner differs)'
+        else                             'Activity + GUMS'
+     end as agent_source
+from final_rows f
+    left join agent_last_application l
+        on trim(lower(f.cleaned_email)) = l.email;
