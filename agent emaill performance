@@ -231,7 +231,6 @@ with partner_name_mapping (raw_name, canonical_name) as (
         ,g.status   as gums_email_status
         ,g.certified
         ,g.partner  as gums_partner
-        ,g.up_code  as gums_up_code
         ,case
             when g.id is null then null
             when g.partner is not null and trim(g.partner) <> ''
@@ -267,7 +266,7 @@ with partner_name_mapping (raw_name, canonical_name) as (
         ,total_applications, total_loans, gmv, cabins_booked
         ,agent_details_id, agent_create_date, type, external_roles
         ,id, name, family_name, gums_email, gums_enabled, gums_email_status, certified
-        ,gums_partner, gums_up_code, partner_match
+        ,gums_partner, partner_match
         ,0 as no_2026_activity
     from gums_matched
     where rn = 1
@@ -304,7 +303,6 @@ with partner_name_mapping (raw_name, canonical_name) as (
         ,g.status                  as gums_email_status
         ,g.certified
         ,g.partner                 as gums_partner
-        ,g.up_code                 as gums_up_code
         ,null                      as partner_match
         ,1                         as no_2026_activity
     from gums_non_test_email g
