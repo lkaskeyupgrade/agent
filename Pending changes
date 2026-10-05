@@ -1,0 +1,48 @@
+# agent_email_performance: backlog / next time
+
+Preferences: always send bullet lists; always show comparisons in tables, with the headers "Old run" and "New run".
+
+## Where things stand (as of Oct 5)
+- Main query file: agent_email_performance_union.sql (writes commercial_analytics.dev.agent_email_performance). It is ready to publish but was NOT yet run after the latest changes (agent-channel fallback, single upcode column)
+- Agent file now read from commercial_analytics.commercial_analytics.agent_email_dsr3653 (volume step removed)
+- Only one upcode column is output: `upcode`, from bi_application.uplift_upcode matched to partner_classification_aggregate (gums_up_code was removed at user request)
+
+## Do first when reopening
+- Rerun the main query, then rerun the reason-split query (all 2026 applications with "agent" in partner_short, split by why they are or are not in the table)
+  - Before the rebuild: in table 190,484; test agent 17; not in bi_application 3,740; upcode not in classification 5; classified as another channel 15,083; other 201 (total 209,530)
+  - After the rebuild expect: in table about 194,200; "not in bi_application" about 0
+- Look at the 15,083 applications classified as another channel (agent in partner name, but partner_classification_aggregate channel is not "agent")
+  - Query: group by pc.channel, a.partner_short for these applications
+  - Decide: real agent partners that are misclassified (data fix) or a deliberate other channel (stay out)
+  - If real agents, agent counts and the "days since last application" signal are understated
+- Look at the 201 "other (unexplained)" applications
+
+## Add next time
+- Fix registration_date (found in the Oct 5 run comparison)
+  - Problem: registration_date today = earliest agent_create_date joined by agent_details_id = id. In the Oct 5 run it equals the agent's first 2026 activity date for ~97% of agents and ranges 2026-01-01 to 2026-10-05, so it is NOT a true registration date (the id looks like a per-order/session record, not a per-agent record)
+  - Proposed fix: take the earliest create_date per CLEANED EMAIL from agent_email_dsr3653 (has an email column; goes back to 2024), instead of (or ahead of) the id-based date
+  - Also fills GUMS-only agents (no agent_details_id), which are blank today
+  - Build: collapse the agent file to one row per cleaned email (earliest create_date), cleaning with regexp_replace(email, '^UP-[^_]+_', '') + trim(lower()); join to each agent by email_key in the final select
+  - Check first: UP- prefix on file emails; duplicate ids (version / update_date), via rows vs distinct id count; confirm min(create_date) by email actually goes back before 2026
+  - Until fixed: drop registration_date from what is published or label it "first 2026 activity" (the query has a caution comment)
+- Show inactive partner records for multi-partner agents
+  - Today the GUMS-only part excludes any email that has 2026 activity, so an idle partner record is hidden if the same email was active under another partner
+  - Change: match Part 2 on email PLUS partner instead of email alone, so each idle partner relationship appears
+  - Watch out: partner names do not always match cleanly between GUMS and activity data (e.g. NCL Outbound vs Norwegian Cruise Line, Carnival GoCCL); use the existing partner_match logic or a mapping rather than exact equality
+  - Decide how last_application_date / days_since_last_application / application_signal should work (agent level by email today; may need to be per email + partner)
+- Optional: merchant_id fallback to fill upcode / integration_type / agent_type for the ~3,740 applications not in bi_application (not tested; check match rate first)
+- Decide whether "VAX Agent - Web US" (195 applications) is really agent channel (included by the "agent" partner-name rule)
+
+## Confirmed
+- partner_classification_aggregate column names (integration_type, agent_type): confirmed by user
+- merchant_country exists on bi_application_detailed; bi_loan_detailed uses `country` (aliased to merchant_country); partner_confirmation exists only on loans
+- bi_application has uplift_upcode and no application in it has a blank one; 3,741 agent-named applications are not in bi_application at all (their channel_redshift is also null), so the fallback uses the partner name containing "Agent"
+- GUMS: an agent (email) can belong to multiple partners, so multiple GUMS rows per email is expected
+  - Keep one row per GUMS record in the GUMS-only part; count DISTINCT email for agent counts
+  - GUMS-only rows 156,231 vs 122,148 distinct emails is therefore expected
+- Oct 5 run vs Sep 29 run reconciled (activity dated <= 9/29): +308 loans / +$1.35M GMV = 179 existing applications that now have a loan (late disbursement, +$737K) + 187 loans on 549 applications newly classified agent-channel (+$869K) - 58 loans on 3,530 applications no longer in the agent channel (-$257K; those 3,470 are "No Partner Grouping Attached" applications missing from bi_application, now restored by the fallback)
+- 168 vault-encrypted emails from Sep 29 now come through as real emails and match GUMS
+
+## Other open items
+- 39 loan-only rows have no upcode / agent_type / integration_type (no agent-channel upcode); expect about 3,740 more blank-upcode rows after the fallback
+- Consider writing to a v2 table name before overwriting agent_email_performance
