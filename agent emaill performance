@@ -1,20 +1,7 @@
 -- ====================================================================
--- PREREQUISITE (run once, or whenever the source CSV changes)
--- ====================================================================
-
-create or replace table commercial_analytics.dev.agent_email_eng as
-select *
-from read_files(
-    '/Volumes/commercial_analytics/commercial_analytics/agent_email/dsr-3550_dec.csv',
-    format => 'csv',
-    header => true
-);
-
-
--- ====================================================================
 -- MAIN QUERY
 -- Part 1: every 2026 application/loan, enriched with GUMS (test agents removed)
--- Part 2: active GUMS agents with NO 2026 activity (no_2026_activity = 1)
+-- Part 2: GUMS agents with NO 2026 activity (no_2026_activity = 1)
 -- ====================================================================
 
 create or replace table commercial_analytics.dev.agent_email_performance as
@@ -36,22 +23,29 @@ with partner_name_mapping (raw_name, canonical_name) as (
         ('JetBlue', 'JetBlue Vacations')
 )
 
+-- read GUMS once; flag the -99 (test) records
+-- email_key = email with the 'UP-xxxx_' prefix removed, same as the activity side
+,gums_all as (
+    select *
+        ,trim(lower(regexp_replace(email, '^UP-[^_]+_', ''))) as email_key
+        ,case when right(trim(up_code), 2) = '99' then 1 else 0 end as is_99
+    from hive_metastore.bi_layer.bi_gums_agent
+)
+
 -- test agents = emails whose GUMS records are ALL up_code -99
 -- (agents with both a -51 and a -99 record are real and are kept)
-,test_agents as (
-    select trim(lower(regexp_replace(email, '^UP-[^_]+_', ''))) as email
-    from hive_metastore.bi_layer.bi_gums_agent
-    group by trim(lower(regexp_replace(email, '^UP-[^_]+_', '')))
-    having min(case when right(trim(up_code), 2) = '99' then 1 else 0 end) = 1
+,test_agents_exclude as (
+    select email_key as email
+    from gums_all
+    group by email_key
+    having min(is_99) = 1
 )
 
 -- real GUMS records only (the -99 records are ignored)
--- email_key = email with the 'UP-xxxx_' prefix removed, same as the activity side
-,gums as (
+,gums_non_test_email as (
     select *
-        ,trim(lower(regexp_replace(email, '^UP-[^_]+_', ''))) as email_key
-    from hive_metastore.bi_layer.bi_gums_agent
-    where up_code is null or right(trim(up_code), 2) <> '99'
+    from gums_all
+    where is_99 = 0
 )
 
 -- one row per application; the agent with the highest agent_details_id wins
@@ -78,11 +72,33 @@ with partner_name_mapping (raw_name, canonical_name) as (
                 on a.application_id = al.application_id
             left join databrickstors_canalytics_catalog.bnplapplication.order_request ord
                 on al.order_details_id = ord.order_details_id
-            left join commercial_analytics.dev.agent_email_eng s
+            left join commercial_analytics.commercial_analytics.agent_email_dsr3653 s
                 on ord.agent_details_id = s.id
         where a.date_etz >= '2026-01-01'
     )
     where rn = 1
+)
+
+-- one row per agent-channel upcode, with its integration type
+-- (grouped so an upcode that appears more than once cannot duplicate applications)
+,agent_upcodes as (
+    select
+        upper(trim(upcode)) as upcode
+        ,max(integration_type) as integration_type
+        ,max(agent_type) as agent_type
+    from commercial_analytics.public.partner_classification_aggregate
+    where lower(channel) = 'agent'
+    group by upper(trim(upcode))
+)
+
+-- used only to look up the application's upcode in partner_classification_aggregate
+-- (loan_id = application_id, so loans use this too)
+,app_upcode as (
+    select
+        application_id
+        ,max(upper(trim(uplift_upcode))) as upcode
+    from commercial_analytics.public.bi_application
+    group by application_id
 )
 
 ,apps as (
@@ -90,8 +106,17 @@ with partner_name_mapping (raw_name, canonical_name) as (
         a.application_id
         ,coalesce(m.canonical_name, a.partner_grouping_redshift, a.partner_grouping_legacy) as partner_group
         ,a.partner_short
-        ,regexp_replace(a.agent_email, '^UP-[^_]+_', '') as cleaned_email
+        -- no usable email (null, blank, or an encrypted vault token) -> one catch-all bucket
+        ,case
+            when a.agent_email is null or trim(a.agent_email) = '' or a.agent_email like '@v:database@vault%'
+                then 'Agent - Unknown Email'
+            else regexp_replace(a.agent_email, '^UP-[^_]+_', '')
+         end as cleaned_email
         ,a.date_etz as app_date
+        ,a.merchant_country
+        ,au.upcode
+        ,au.integration_type
+        ,au.agent_type
         ,aa.agent_details_id
         ,aa.agent_create_date
         ,aa.type
@@ -101,11 +126,21 @@ with partner_name_mapping (raw_name, canonical_name) as (
             on upper(trim(coalesce(a.partner_grouping_redshift, a.partner_grouping_legacy))) = upper(trim(m.raw_name))
         left join application_agent aa
             on a.application_id = aa.application_id
-    where a.agent_email is not null
-      and a.date_etz >= '2026-01-01'
-      -- and lower(a.channel) = 'agent'
+        left join app_upcode u
+            on a.application_id = u.application_id
+        left join agent_upcodes au
+            on u.upcode = au.upcode
+    where a.date_etz >= '2026-01-01'
+      -- agent channel only:
+      --  (1) the application's upcode belongs to an agent-channel partner, OR
+      --  (2) the application is not in bi_application at all (so no upcode exists) and
+      --      the partner name says Agent; channel_redshift is null for these
+      and (
+            au.upcode is not null
+            or (u.application_id is null and lower(a.partner_short) like '%agent%')
+      )
       and not exists (
-            select 1 from test_agents t
+            select 1 from test_agents_exclude t
             where t.email = trim(lower(regexp_replace(a.agent_email, '^UP-[^_]+_', '')))
       )
 )
@@ -115,8 +150,17 @@ with partner_name_mapping (raw_name, canonical_name) as (
         l.loan_id
         ,coalesce(m.canonical_name, l.partner_grouping_redshift, l.partner_grouping_legacy) as partner_group
         ,l.partner_short
-        ,regexp_replace(l.agent_email, '^UP-[^_]+_', '') as cleaned_email
+        ,case
+            when l.agent_email is null or trim(l.agent_email) = '' or l.agent_email like '@v:database@vault%'
+                then 'Agent - Unknown Email'
+            else regexp_replace(l.agent_email, '^UP-[^_]+_', '')
+         end as cleaned_email
         ,l.date_etz as loan_date
+        ,l.country as merchant_country
+        ,l.partner_confirmation
+        ,au.upcode
+        ,au.integration_type
+        ,au.agent_type
         ,l.gmv_usd as gmv
         ,case when l.partner_confirmation is null or trim(l.partner_confirmation) = ''
               then 0
@@ -133,13 +177,16 @@ with partner_name_mapping (raw_name, canonical_name) as (
             on upper(trim(coalesce(l.partner_grouping_redshift, l.partner_grouping_legacy))) = upper(trim(m.raw_name))
         left join application_agent aa
             on l.loan_id = aa.application_id
+        left join app_upcode u
+            on l.loan_id = u.application_id
+        left join agent_upcodes au
+            on u.upcode = au.upcode
     where l.date_etz >= '2026-01-01'
       and l.loan_count = 1
       and (la.date_etz is null or l.date_etz >= la.date_etz)
       and lower(l.channel) = 'agent'
-      and l.agent_email is not null
       and not exists (
-            select 1 from test_agents t
+            select 1 from test_agents_exclude t
             where t.email = trim(lower(regexp_replace(l.agent_email, '^UP-[^_]+_', '')))
       )
 )
@@ -153,6 +200,15 @@ with partner_name_mapping (raw_name, canonical_name) as (
         ,coalesce(a.app_date, l.loan_date) as activity_date
         ,case when a.application_id is not null then 1 else 0 end as total_applications
         ,case when l.loan_id is not null then 1 else 0 end as total_loans
+        ,coalesce(a.upcode, l.upcode) as upcode
+        ,coalesce(l.merchant_country, a.merchant_country) as merchant_country
+        ,l.partner_confirmation
+        ,coalesce(a.integration_type, l.integration_type) as integration_type
+        ,coalesce(a.agent_type, l.agent_type) as agent_type
+        ,case
+            when lower(coalesce(a.partner_short, l.partner_short)) like '%outbound%' then 'Outbound'
+            when lower(coalesce(a.partner_short, l.partner_short)) like '%inbound%'  then 'Inbound'
+         end as call_center_type
         ,l.gmv
         ,l.cabins_booked
         ,coalesce(a.agent_details_id, l.agent_details_id) as agent_details_id
@@ -175,6 +231,7 @@ with partner_name_mapping (raw_name, canonical_name) as (
         ,g.status   as gums_email_status
         ,g.certified
         ,g.partner  as gums_partner
+        ,g.up_code  as gums_up_code
         ,case
             when g.id is null then null
             when g.partner is not null and trim(g.partner) <> ''
@@ -196,7 +253,7 @@ with partner_name_mapping (raw_name, canonical_name) as (
                 g.id
         ) as rn
     from combined c
-        left join gums g
+        left join gums_non_test_email g
             on trim(lower(c.cleaned_email)) = g.email_key
 )
 
@@ -206,23 +263,31 @@ with partner_name_mapping (raw_name, canonical_name) as (
     -- PART 1: all 2026 activity
     select
         application_id, cleaned_email, partner_group, partner_short, activity_date
+        ,upcode, merchant_country, partner_confirmation, integration_type, agent_type, call_center_type
         ,total_applications, total_loans, gmv, cabins_booked
         ,agent_details_id, agent_create_date, type, external_roles
         ,id, name, family_name, gums_email, gums_enabled, gums_email_status, certified
-        ,gums_partner, partner_match
+        ,gums_partner, gums_up_code, partner_match
         ,0 as no_2026_activity
     from gums_matched
     where rn = 1
 
     union all
 
-    -- PART 2: active GUMS agents with no 2026 activity at all
+    -- PART 2: ALL non-test GUMS agents with no 2026 activity
+    -- (enabled / email_status / certified are attributes: filter on them downstream)
     select
         null                       as application_id
         ,g.email_key               as cleaned_email
         ,g.partner                 as partner_group
         ,null                      as partner_short
         ,null                      as activity_date
+        ,null                      as upcode
+        ,null                      as merchant_country
+        ,null                      as partner_confirmation
+        ,null                      as integration_type
+        ,null                      as agent_type
+        ,null                      as call_center_type
         ,0                         as total_applications
         ,0                         as total_loans
         ,null                      as gmv
@@ -239,12 +304,11 @@ with partner_name_mapping (raw_name, canonical_name) as (
         ,g.status                  as gums_email_status
         ,g.certified
         ,g.partner                 as gums_partner
+        ,g.up_code                 as gums_up_code
         ,null                      as partner_match
         ,1                         as no_2026_activity
-    from gums g
-    where g.enabled = 1
-      and g.status = 'CONFIRMED'
-      and not exists (
+    from gums_non_test_email g
+    where not exists (
             select 1 from combined c
             where trim(lower(c.cleaned_email)) = g.email_key
       )
@@ -255,7 +319,9 @@ with partner_name_mapping (raw_name, canonical_name) as (
     select
         trim(lower(cleaned_email)) as email
         ,max(case when total_applications = 1 then cast(activity_date as date) end) as last_application_date
-        ,sum(total_loans) as loans_2026
+        -- CAUTION: this is the earliest agent_email_dsr3653 create_date joined by agent_details_id.
+        -- It tracks the agent's first 2026 activity, not a true registration date.
+        ,min(cast(agent_create_date as date)) as registration_date
     from final_rows
     group by trim(lower(cleaned_email))
 )
@@ -263,17 +329,19 @@ with partner_name_mapping (raw_name, canonical_name) as (
 select
     f.*
     ,l.last_application_date
+    ,l.registration_date
     ,datediff(
         cast(from_utc_timestamp(current_timestamp(), 'America/New_York') as date),
         l.last_application_date
      ) as days_since_last_application          -- NULL when the agent has no application
     ,case
         when l.last_application_date is not null then 'Has 2026 application'
-        when l.loans_2026 > 0                    then 'No 2026 application (loans only)'
+        when f.no_2026_activity = 0              then 'No 2026 application'
         else                                          'No 2026 activity'
      end as application_signal
     ,case
         when f.no_2026_activity = 1 then 'GUMS only (no 2026 activity)'
+        when f.cleaned_email = 'Agent - Unknown Email' then 'Activity only (unknown agent email)'
         when f.id is null           then 'Activity only (email not in GUMS)'
         when f.partner_match = 0    then 'Activity + GUMS (partner differs)'
         else                             'Activity + GUMS'
