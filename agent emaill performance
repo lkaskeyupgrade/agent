@@ -1,11 +1,112 @@
+
+Claude Desktop (Windows), Connected
+/
+Claude finished the response
+This confirms it. The rows are not duplicates, and they show where a real registration date probably lives.
+
+What this agent's rows show
+
+Rows	type	create_date	version	What it looks like
+2 (ids 8820894, 8820895)	STANDALONE	2024-11-06, two minutes apart	1 (updated Feb 2026)	Long-lived records from when the agent first appeared
+About 48 shown	CONNECT	Jan 3 to Jan 23, 2026, many per day	0, mostly never updated	One new record per session or order
+Not duplicates: every row has its own id, timestamp and type. The CONNECT rows are spaced minutes to hours apart, which looks like one record per session or order. That matches what I inferred.
+Version: version 1 means the record was edited later, and version 0 means it wasn't. It doesn't mean a duplicate copy.
+Registration date:
+This agent's earliest record is 2024-11-06, a long way before any of the 2026 session records.
+So the earliest create_date per email probably gives a real registration date, and 2024-11-06 here.
+The current registration_date gives early 2026 for this agent, because it follows only the record each application points to.
+I'd treat this as a promising lead from one agent, not a confirmed rule.
+Possible difference between agents:
+This agent has two STANDALONE records, but the pre-2026 row count is about one per email overall (30,509 rows for 30,233 emails).
+So the pattern may not hold for everyone.
+Run the check below before relying on it.
+external_roles is [] on every row shown:
+If that is common, adding it to call_center_type won't add many Inbound or Outbound values.
+After the next run, compare the fill rate with the 12,317 rows from before.
+If it barely moves, I'd check how many rows have a non-empty role.
+This checks how many agents have a record created before 2026:
+
+sql
+select
+    count(*) as emails
+    ,sum(case when first_created < '2026-01-01' then 1 else 0 end) as emails_with_pre_2026_record
+    ,min(first_created) as earliest
+from (
+    select trim(lower(regexp_replace(email, '^UP-[^_]+_', ''))) as email, min(create_date) as first_created
+    from commercial_analytics.commercial_analytics.agent_email_dsr3653
+    group by 1
+);
+If most emails have a pre-2026 record: the email-based fix is a good registration date, and I'd make it the main source. That is already in the backlog note.
+If only a few do: the date would just track each agent's first session, and I'd drop the column.
+Four columns have "gums" in the name in the latest query, and all four come from the GUMS agent table.
+
+Column	What it holds
+gums_email	The agent's email from GUMS (now lowercase, prefix stripped)
+gums_enabled	Whether the GUMS record is enabled
+gums_email_status	The GUMS email status, such as CONFIRMED
+gums_partner	The partner on the GUMS record
+Other GUMS fields without "gums" in the name: id, name, family_name and certified also come from GUMS.
+Not a column, but mentions GUMS: the text values in agent_source, such as "GUMS only (no 2026 activity)".
+Removed: gums_up_code is no longer in the output.
+Is there another email column?  And another partner column?
+
+Yes to both. Each has more than one column, and for email the two columns are now nearly identical.
+
+Email columns
+
+Column	Source	Notes
+cleaned_email	The application's or loan's agent email, or the GUMS email for GUMS-only rows	Lowercase, prefix stripped. "Agent - Unknown Email" when there's no usable email
+gums_email	The matched GUMS record	Blank when the activity email has no GUMS match
+Why they are nearly the same:
+After this change, both are lowercase with the prefix removed.
+The GUMS match is made on that same cleaned value, so when a row matches, the two are identical.
+They differ only when the email is not in GUMS (gums_email blank) or the email is "Agent - Unknown Email".
+So gums_email adds little now. I can drop it if you'd like.
+Partner columns
+
+Column	Source	Notes
+partner_group	The application's or loan's partner grouping, with names standardized by the mapping	For GUMS-only rows it is the GUMS partner
+partner_short	partner_short on the application or loan	More specific, such as "Norwegian Cruise Line - Agent US - Outbound". Blank for GUMS-only rows
+gums_partner	The partner on the matched GUMS record	Can differ from the activity partner
+Related column: partner_match is 1 or 0 and says whether gums_partner and partner_group agree. It is blank when there is no GUMS match.
+Why GUMS partners can differ: an agent can belong to more than one partner in GUMS, or the partner names are spelled differently, such as "NCL Outbound" against "Norwegian Cruise Line".
+Only include cleaned_email
+
+which partner column sihould I sue
+
+
+Ran a command, shared files
+Ran a command, shared files
+I removed gums_email, so cleaned_email is the only email column. The updated file is attached, and I haven't run it. It replaces the previous file, so rerun this one.
+
+Email: gums_email is gone, and the GUMS match still works the same way. gums_email_status is a different column and stays.
+Which partner column to use
+
+Column	Use it for	Watch out for
+partner_group	Reporting and grouping. It is the standardized partner name, filled on every row	About 3,700 rows restored by the fallback show "No Partner Grouping Attached"
+partner_short	Detail, such as the program or channel, like "Norwegian Cruise Line - Agent US - Outbound"	Blank for GUMS-only agents
+gums_partner	Comparing the activity partner with the agent's GUMS partner	Can differ because of multiple partners or spelling
+My recommendation: use partner_group for most reporting, since it is the standardized name.
+For the fallback rows:
+Those rows have no real partner group, so use partner_short for them.
+If you want one column that always works, I can fill partner_group from partner_short when it says "No Partner Grouping Attached". That is a small change, but it changes the output, so I haven't made it.
+
+Agent email performance union
+Code·SQL 
+
+
+
+
+Claude is AI and can make mistakes. Please double-check responses.
+Agent email performance union · SQL
 -- ====================================================================
 -- MAIN QUERY
 -- Part 1: every 2026 application/loan, enriched with GUMS (test agents removed)
 -- Part 2: GUMS agents with NO 2026 activity (no_2026_activity = 1)
 -- ====================================================================
-
+ 
 create or replace table commercial_analytics.dev.agent_email_performance as
-
+ 
 with partner_name_mapping (raw_name, canonical_name) as (
     values
         ('COLUMBUS ZOO', 'Columbus Zoo'),
@@ -22,16 +123,16 @@ with partner_name_mapping (raw_name, canonical_name) as (
         ('Sunwing Vacations', 'Sunwing Vacations Group'),
         ('JetBlue', 'JetBlue Vacations')
 )
-
+ 
 -- read GUMS once; flag the -99 (test) records
 -- email_key = email with the 'UP-xxxx_' prefix removed, same as the activity side
 ,gums_all as (
     select *
-        ,trim(lower(regexp_replace(email, '^UP-[^_]+_', ''))) as email_key
+        ,regexp_replace(lower(trim(email)), '^up-[^_]+_', '') as email_key
         ,case when right(trim(up_code), 2) = '99' then 1 else 0 end as is_99
     from hive_metastore.bi_layer.bi_gums_agent
 )
-
+ 
 -- test agents = emails whose GUMS records are ALL up_code -99
 -- (agents with both a -51 and a -99 record are real and are kept)
 ,test_agents_exclude as (
@@ -40,14 +141,14 @@ with partner_name_mapping (raw_name, canonical_name) as (
     group by email_key
     having min(is_99) = 1
 )
-
+ 
 -- real GUMS records only (the -99 records are ignored)
 ,gums_non_test_email as (
     select *
     from gums_all
     where is_99 = 0
 )
-
+ 
 -- one row per application; the agent with the highest agent_details_id wins
 ,application_agent as (
     select application_id, agent_details_id, agent_create_date, type, external_roles
@@ -78,7 +179,7 @@ with partner_name_mapping (raw_name, canonical_name) as (
     )
     where rn = 1
 )
-
+ 
 -- one row per agent-channel upcode, with its integration type
 -- (grouped so an upcode that appears more than once cannot duplicate applications)
 ,agent_upcodes as (
@@ -90,7 +191,7 @@ with partner_name_mapping (raw_name, canonical_name) as (
     where lower(channel) = 'agent'
     group by upper(trim(upcode))
 )
-
+ 
 -- used only to look up the application's upcode in partner_classification_aggregate
 -- (loan_id = application_id, so loans use this too)
 ,app_upcode as (
@@ -100,7 +201,7 @@ with partner_name_mapping (raw_name, canonical_name) as (
     from commercial_analytics.public.bi_application
     group by application_id
 )
-
+ 
 ,apps as (
     select
         a.application_id
@@ -110,7 +211,7 @@ with partner_name_mapping (raw_name, canonical_name) as (
         ,case
             when a.agent_email is null or trim(a.agent_email) = '' or a.agent_email like '@v:database@vault%'
                 then 'Agent - Unknown Email'
-            else regexp_replace(a.agent_email, '^UP-[^_]+_', '')
+            else regexp_replace(lower(trim(a.agent_email)), '^up-[^_]+_', '')
          end as cleaned_email
         ,a.date_etz as app_date
         ,a.merchant_country
@@ -141,10 +242,12 @@ with partner_name_mapping (raw_name, canonical_name) as (
       )
       and not exists (
             select 1 from test_agents_exclude t
-            where t.email = trim(lower(regexp_replace(a.agent_email, '^UP-[^_]+_', '')))
+            where t.email = regexp_replace(lower(trim(a.agent_email)), '^up-[^_]+_', '')
       )
+      -- any upcode ending in -99 is a test code: never include
+      and coalesce(right(u.upcode, 3), '') <> '-99'
 )
-
+ 
 ,loans as (
     select
         l.loan_id
@@ -153,7 +256,7 @@ with partner_name_mapping (raw_name, canonical_name) as (
         ,case
             when l.agent_email is null or trim(l.agent_email) = '' or l.agent_email like '@v:database@vault%'
                 then 'Agent - Unknown Email'
-            else regexp_replace(l.agent_email, '^UP-[^_]+_', '')
+            else regexp_replace(lower(trim(l.agent_email)), '^up-[^_]+_', '')
          end as cleaned_email
         ,l.date_etz as loan_date
         ,l.country as merchant_country
@@ -187,10 +290,12 @@ with partner_name_mapping (raw_name, canonical_name) as (
       and lower(l.channel) = 'agent'
       and not exists (
             select 1 from test_agents_exclude t
-            where t.email = trim(lower(regexp_replace(l.agent_email, '^UP-[^_]+_', '')))
+            where t.email = regexp_replace(lower(trim(l.agent_email)), '^up-[^_]+_', '')
       )
+      -- any upcode ending in -99 is a test code: never include
+      and coalesce(right(u.upcode, 3), '') <> '-99'
 )
-
+ 
 ,combined as (
     select
         coalesce(a.application_id, l.loan_id) as application_id
@@ -205,9 +310,12 @@ with partner_name_mapping (raw_name, canonical_name) as (
         ,l.partner_confirmation
         ,coalesce(a.integration_type, l.integration_type) as integration_type
         ,coalesce(a.agent_type, l.agent_type) as agent_type
+        -- Outbound / Inbound: look in partner_short first, then in the agent's external_roles
         ,case
             when lower(coalesce(a.partner_short, l.partner_short)) like '%outbound%' then 'Outbound'
             when lower(coalesce(a.partner_short, l.partner_short)) like '%inbound%'  then 'Inbound'
+            when lower(coalesce(a.external_roles, l.external_roles)) like '%outbound%' then 'Outbound'
+            when lower(coalesce(a.external_roles, l.external_roles)) like '%inbound%'  then 'Inbound'
          end as call_center_type
         ,l.gmv
         ,l.cabins_booked
@@ -219,14 +327,13 @@ with partner_name_mapping (raw_name, canonical_name) as (
         full outer join loans l
             on a.application_id = l.loan_id
 )
-
+ 
 ,gums_matched as (
     select
         c.*
         ,g.id
         ,g.name
         ,g.family_name
-        ,g.email    as gums_email
         ,g.enabled  as gums_enabled
         ,g.status   as gums_email_status
         ,g.certified
@@ -255,24 +362,24 @@ with partner_name_mapping (raw_name, canonical_name) as (
         left join gums_non_test_email g
             on trim(lower(c.cleaned_email)) = g.email_key
 )
-
+ 
 -- PART 1 + PART 2 combined into one CTE so we can add the "days since last application" fields
 ,final_rows as (
-
+ 
     -- PART 1: all 2026 activity
     select
         application_id, cleaned_email, partner_group, partner_short, activity_date
         ,upcode, merchant_country, partner_confirmation, integration_type, agent_type, call_center_type
         ,total_applications, total_loans, gmv, cabins_booked
-        ,agent_details_id, agent_create_date, type, external_roles
-        ,id, name, family_name, gums_email, gums_enabled, gums_email_status, certified
+        ,agent_details_id, agent_create_date, type
+        ,id, name, family_name, gums_enabled, gums_email_status, certified
         ,gums_partner, partner_match
         ,0 as no_2026_activity
     from gums_matched
     where rn = 1
-
+ 
     union all
-
+ 
     -- PART 2: ALL non-test GUMS agents with no 2026 activity
     -- (enabled / email_status / certified are attributes: filter on them downstream)
     select
@@ -294,11 +401,9 @@ with partner_name_mapping (raw_name, canonical_name) as (
         ,null                      as agent_details_id
         ,null                      as agent_create_date
         ,null                      as type
-        ,null                      as external_roles
         ,g.id
         ,g.name
         ,g.family_name
-        ,g.email                   as gums_email
         ,g.enabled                 as gums_enabled
         ,g.status                  as gums_email_status
         ,g.certified
@@ -311,7 +416,7 @@ with partner_name_mapping (raw_name, canonical_name) as (
             where trim(lower(c.cleaned_email)) = g.email_key
       )
 )
-
+ 
 -- most recent application per agent (applications only, not loan-only rows)
 ,agent_last_application as (
     select
@@ -323,7 +428,7 @@ with partner_name_mapping (raw_name, canonical_name) as (
     from final_rows
     group by trim(lower(cleaned_email))
 )
-
+ 
 select
     f.*
     ,l.last_application_date
@@ -347,3 +452,7 @@ select
 from final_rows f
     left join agent_last_application l
         on trim(lower(f.cleaned_email)) = l.email;
+ 
+
+Downloaded agent_email_performance_union_15.sql
+
